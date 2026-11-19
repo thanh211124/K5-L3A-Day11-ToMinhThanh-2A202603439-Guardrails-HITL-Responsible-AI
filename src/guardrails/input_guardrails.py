@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,67 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+_ZERO_WIDTH = "​‌‍‎‏‪‫‬‭‮⁠⁡⁢⁣﻿­"
+
+BLOCK_INJECTION_MESSAGE = (
+    "I cannot process that request. I can only help with genuine VinBank banking questions."
+)
+BLOCK_TOPIC_MESSAGE = (
+    "I'm a VinBank assistant and can only help with banking-related questions "
+    "(accounts, transactions, savings, loans, credit cards)."
+)
+
+
+def _canonicalize(text: str) -> str:
+    """NFKC + strip invisible chars + collapse whitespace (defeats `Ignore\\u200b all`)."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(str.maketrans("", "", _ZERO_WIDTH))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _fold_accents(text: str) -> str:
+    """Lowercase + drop Vietnamese diacritics so 'tài khoản' matches 'tai khoan'."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+    return stripped.lower()
+
+
+INJECTION_PATTERNS = [
+    r"ignore (?:all |any |the )?(?:your )?(?:previous |above |prior |earlier )?(?:instructions?|rules?|prompts?|directives?)",
+    r"disregard (?:all |any |the )?(?:your )?(?:previous |above |prior )?(?:instructions?|rules?|directives?)",
+    r"forget (?:all |everything |your )?(?:previous |above |prior )?(?:instructions?|rules?|prompt)",
+    r"override (?:your |the )?(?:system )?(?:prompt|instructions?|rules?)",
+    r"you are now\b",
+    r"(?-i:\bDAN\b)",  # case-sensitive: avoid matching Vietnamese "dân"
+    r"\bdo anything now\b",
+    r"\bjailbreak",
+    r"system prompt",
+    r"(?:developer|debug|god) mode",
+    r"reveal (?:your |the )?(?:hidden |secret |internal |system )?(?:instructions?|prompt|rules?|secrets?|passwords?|credentials?|api ?keys?)",
+    r"(?:show|print|repeat|output|display) (?:me )?(?:your |the )?(?:full |entire |hidden )?(?:system |initial )?(?:prompt|instructions?)",
+    r"pretend (?:you are|to be|you're)",
+    r"act as (?:a |an )?(?:unrestricted|unfiltered|jailbroken|evil|different|new)",
+    r"role ?-?play as",
+    r"without (?:any )?(?:restrictions?|limitations?|filters?|rules?)",
+    r"(?:admin|root|database|db) ?(?:password|credentials?)",
+    r"api ?key",
+    r"connection string",
+    r"(?:base64|rot13)",
+    # SQL injection / destructive statements smuggled into a "banking" question
+    r"\b(?:drop|truncate)\s+table\b",
+    r"\bunion\s+select\b",
+    r"\bselect\b.+\bfrom\b",
+    r";\s*(?:delete|insert|update|drop)\b",
+    # Vietnamese
+    r"bo qua (?:moi |tat ca )?(?:huong dan|chi dan|quy tac)",
+    r"quen (?:moi |tat ca )?(?:huong dan|chi dan|quy tac)",
+    r"tiet lo (?:mat khau|api|system ?prompt|huong dan)",
+    r"(?:cho toi|hay) (?:xem )?(?:mat khau|system ?prompt|api ?key)",
+    r"gia vo (?:la|ban la)",
+]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,15 +113,13 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return "BLOCK"
+    canon = _canonicalize(user_input)
+    # Check both the raw canonical text (English/Unicode) and the accent-folded
+    # text (Vietnamese patterns written without diacritics).
+    for text in (canon, _fold_accents(canon)):
+        for pattern in INJECTION_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return "BLOCK"
     return "ALLOW"
 
 
@@ -84,14 +144,17 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = _fold_accents(_canonicalize(user_input))
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # Word-start match (not raw substring) so "skill" does not hit "kill".
+    def _has(topic: str) -> bool:
+        return re.search(r"\b" + re.escape(_fold_accents(topic)), input_lower) is not None
 
-    pass  # Replace with your implementation
+    if any(_has(t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(_has(t) for t in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +207,13 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
-
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(BLOCK_INJECTION_MESSAGE)
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(BLOCK_TOPIC_MESSAGE)
+        return None
 
 
 # ============================================================
